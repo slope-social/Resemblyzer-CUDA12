@@ -1,29 +1,25 @@
 from setuptools import setup, find_packages
 
-with open("README.md", "r") as f:
-    long_description = f.read()
-
-with open("requirements_package.txt", "r") as f:
-    requirements = f.read().splitlines()
-
 setup(
-    name="Resemblyzer",
-    version="0.1.4",
+    name="resemblyzer",
+    version="0.2.0",
+    description="Real Time Voice Cloning: Transfer learning from Speaker Verification to Multispeaker Text-To-Speech Synthesis",
+    url="https://github.com/slope-social/Resemblyzer-CUDA12",
+    author="Slope Social",
+    author_email="hey@slope.social",
     packages=find_packages(),
     package_data={
-        "resemblyzer": ["pretrained.pt"]
+        "resemblyzer": ["pretrained.pt"],
     },
-    python_requires=">=3.5",
-    install_requires=requirements,
-    author="Corentin Jemine",
-    author_email="corentin@resemble.ai",
-    description="Analyze and compare voices with deep learning",
-    long_description=long_description,
-    long_description_content_type="text/markdown",
-    url="https://github.com/resemble-ai/Resemblyzer",
-    classifiers=[
-        "Programming Language :: Python :: 3",
-        "License :: OSI Approved :: Apache Software License",
-        "Operating System :: OS Independent",
+    python_requires=">=3.7",
+    install_requires=[
+        "torch>=2.0.0",
+        "numpy>=1.17.0",
+        "scipy>=1.3.0",
+        "scikit-learn>=0.22.0",
+        "librosa>=0.8.0",
+        "sounddevice>=0.4.0",
+        "webrtcvad>=2.0.10",
     ],
+    include_package_data=True
 )
