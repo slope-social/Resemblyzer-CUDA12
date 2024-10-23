@@ -18,7 +18,7 @@ def preprocess_wav(fpath_or_wav: Union[str, Path, np.ndarray], source_sr: Option
     :param fpath_or_wav: either a filepath to an audio file (many extensions are supported, not 
     just .wav), either the waveform as a numpy array of floats.
     :param source_sr: if passing an audio waveform, the sampling rate of the waveform before 
-    preprocessing. After preprocessing, the waveform'speaker sampling rate will match the data 
+    preprocessing. After preprocessing, the waveform's sampling rate will match the data 
     hyperparameters. If passing a filepath, the sampling rate will be automatically detected and 
     this argument will be ignored.
     """
@@ -28,8 +28,8 @@ def preprocess_wav(fpath_or_wav: Union[str, Path, np.ndarray], source_sr: Option
     else:
         wav = fpath_or_wav
     
-    # Resample the wav
-    if source_sr is not None:
+    # Resample the wav if necessary
+    if source_sr is not None and source_sr != sampling_rate:
         wav = librosa.resample(wav, orig_sr=source_sr, target_sr=sampling_rate)
         
     # Apply the preprocessing: normalize volume and shorten long silences 
@@ -77,7 +77,7 @@ def trim_long_silences(wav):
     for window_start in range(0, len(wav), samples_per_window):
         window_end = window_start + samples_per_window
         voice_flags.append(vad.is_speech(pcm_wave[window_start * 2:window_end * 2],
-                                         sample_rate=sampling_rate))
+                                       sample_rate=sampling_rate))
     voice_flags = np.array(voice_flags)
     
     # Smooth the voice detection with a moving average
