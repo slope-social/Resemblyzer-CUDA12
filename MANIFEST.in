@@ -1,0 +1,3 @@
+include resemblyzer/pretrained.pt
+include README.md
+include LICENSE.txt
