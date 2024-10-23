@@ -1,177 +1,219 @@
-from resemblyzer.hparams import *
-from resemblyzer import audio
+# First, let's create the updated voice_encoder.py:
+
 from pathlib import Path
-from typing import Union, List
-from torch import nn
-from time import perf_counter as timer
 import numpy as np
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.nn.utils import clip_grad_norm_
+from scipy.interpolate import interp1d
+from sklearn.metrics import roc_curve
+from torch.nn.modules.utils import consume_prefix_in_state_dict_if_present
+import typing as t
 
-
-class VoiceEncoder(nn.Module):
-    def __init__(self, device: Union[str, torch.device]=None, verbose=True, weights_fpath: Union[Path, str]=None):
-        """
-        If None, defaults to cuda if it is available on your machine, otherwise the model will
-        run on cpu. Outputs are always returned on the cpu, as numpy arrays.
-        :param weights_fpath: path to "<CUSTOM_MODEL>.pt" file path.
-        If None, defaults to built-in "pretrained.pt" model
-        """
+class SpeakerEncoder(nn.Module):
+    def __init__(self, device: t.Optional[torch.device] = None, verbose=True):
         super().__init__()
-
-        # Define the network
-        self.lstm = nn.LSTM(mel_n_channels, model_hidden_size, model_num_layers, batch_first=True)
-        self.linear = nn.Linear(model_hidden_size, model_embedding_size)
+        
+        # Define model architecture
+        self.lstm = nn.LSTM(input_size=40,
+                           hidden_size=256, 
+                           num_layers=3,
+                           batch_first=True)
+        self.linear = nn.Linear(in_features=256, 
+                              out_features=256)
         self.relu = nn.ReLU()
 
-        # Get the target device
-        if device is None:
-            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        elif isinstance(device, str):
-            device = torch.device(device)
-        self.device = device
-
-        # Load the pretrained model'speaker weights
-        if weights_fpath is None:
-            weights_fpath = Path(__file__).resolve().parent.joinpath("pretrained.pt")
-        else:
-            weights_fpath = Path(weights_fpath)
-
-        if not weights_fpath.exists():
-            raise Exception("Couldn't find the voice encoder pretrained model at %s." %
-                            weights_fpath)
-        start = timer()
-        checkpoint = torch.load(weights_fpath, map_location="cpu")
-        self.load_state_dict(checkpoint["model_state"], strict=False)
-        self.to(device)
-
+        # Set device
+        self.device = device or torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         if verbose:
-            print("Loaded the voice encoder model on %s in %.2f seconds." %
-                  (device.type, timer() - start))
-
-    def forward(self, mels: torch.FloatTensor):
+            print(f'Using device: {self.device}')
+            if self.device.type == 'cuda':
+                print(f'CUDA version: {torch.version.cuda}')
+        
+        # Move model to device
+        self.to(self.device)
+        
+    def do_gradient_ops(self):
+        # Gradient scale
+        self.similarity_weight.grad *= 0.01
+        self.similarity_bias.grad *= 0.01
+            
+        # Gradient clipping
+        clip_grad_norm_(self.parameters(), 3, norm_type=2)
+    
+    def forward(self, utterances: torch.tensor, hidden_init: t.Optional[torch.tensor] = None):
         """
         Computes the embeddings of a batch of utterance spectrograms.
-
-        :param mels: a batch of mel spectrograms of same duration as a float32 tensor of shape
-        (batch_size, n_frames, n_channels)
-        :return: the embeddings as a float 32 tensor of shape (batch_size, embedding_size).
-        Embeddings are positive and L2-normed, thus they lay in the range [0, 1].
+        
+        :param utterances: batch of mel-scale filterbanks of same duration as a tensor (batch_size, n_frames, n_channels) 
+        :param hidden_init: initial hidden state of the LSTM as a tensor of shape (num_layers, batch_size, hidden_size)
+        :return: the embeddings as a tensor of shape (batch_size, embedding_size)
         """
-        # Pass the input through the LSTM layers and retrieve the final hidden state of the last
-        # layer. Apply a cutoff to 0 for negative values and L2 normalize the embeddings.
-        _, (hidden, _) = self.lstm(mels)
+        # Pass the input through the LSTM layers and retrieve all outputs, the final hidden state
+        out, (hidden, cell) = self.lstm(utterances, hidden_init)
+        
+        # We take only the hidden state of the last layer
         embeds_raw = self.relu(self.linear(hidden[-1]))
-        return embeds_raw / torch.norm(embeds_raw, dim=1, keepdim=True)
+        
+        # L2-normalize it
+        embeds = embeds_raw / (torch.norm(embeds_raw, dim=1, keepdim=True) + 1e-5)
+        
+        return embeds
 
     @staticmethod
-    def compute_partial_slices(n_samples: int, rate, min_coverage):
+    def compute_partial_slices(n_samples: int, rate: float, min_coverage: float):
         """
-        Computes where to split an utterance waveform and its corresponding mel spectrogram to
-        obtain partial utterances of <partials_n_frames> each. Both the waveform and the
-        mel spectrogram slices are returned, so as to make each partial utterance waveform
-        correspond to its spectrogram.
-
-        The returned ranges may be indexing further than the length of the waveform. It is
-        recommended that you pad the waveform with zeros up to wav_slices[-1].stop.
-
-        :param n_samples: the number of samples in the waveform
-        :param rate: how many partial utterances should occur per second. Partial utterances must
-        cover the span of the entire utterance, thus the rate should not be lower than the inverse
-        of the duration of a partial utterance. By default, partial utterances are 1.6s long and
-        the minimum rate is thus 0.625.
-        :param min_coverage: when reaching the last partial utterance, it may or may not have
-        enough frames. If at least <min_pad_coverage> of <partials_n_frames> are present,
-        then the last partial utterance will be considered by zero-padding the audio. Otherwise,
-        it will be discarded. If there aren't enough frames for one partial utterance,
-        this parameter is ignored so that the function always returns at least one slice.
-        :return: the waveform slices and mel spectrogram slices as lists of array slices. Index
-        respectively the waveform and the mel spectrogram with these slices to obtain the partial
-        utterances.
+        Computes where to split an utterance waveform and its corresponding mel spectrogram to obtain 
+        partial utterances of <min_coverage> seconds with <rate> partial utterances per second of audio.
         """
         assert 0 < min_coverage <= 1
+        
+        # Compute how many partial utterances we'll make
+        total_duration = n_samples / sampling_rate
+        n_partials = int(np.ceil(total_duration * rate))
+        
+        # Compute the duration of each partial
+        partial_duration = min_coverage / rate
+        partial_n_samples = int(np.ceil(sampling_rate * partial_duration))
+        coverage = partial_n_samples / sampling_rate
+        
+        # Compute the step between partial utterances
+        step_duration = total_duration / n_partials
+        step = int(np.ceil(sampling_rate * step_duration))
+        
+        # Split the waveform into partials
+        wave_slices = []
+        mel_slices = []
+        for offset in range(0, n_samples, step):
+            wave_slice = slice(offset, offset + partial_n_samples)
+            mel_slice = slice(offset // hop_length, (offset + partial_n_samples) // hop_length)
+            if mel_slice.stop - mel_slice.start <= minimum_frames:
+                break
+            wave_slices.append(wave_slice)
+            mel_slices.append(mel_slice)
+            
+        return wave_slices, mel_slices
 
-        # Compute how many frames separate two partial utterances
-        samples_per_frame = int((sampling_rate * mel_window_step / 1000))
-        n_frames = int(np.ceil((n_samples + 1) / samples_per_frame))
-        frame_step = int(np.round((sampling_rate / rate) / samples_per_frame))
-        assert 0 < frame_step, "The rate is too high"
-        assert frame_step <= partials_n_frames, "The rate is too low, it should be %f at least" % \
-            (sampling_rate / (samples_per_frame * partials_n_frames))
-
-        # Compute the slices
-        wav_slices, mel_slices = [], []
-        steps = max(1, n_frames - partials_n_frames + frame_step + 1)
-        for i in range(0, steps, frame_step):
-            mel_range = np.array([i, i + partials_n_frames])
-            wav_range = mel_range * samples_per_frame
-            mel_slices.append(slice(*mel_range))
-            wav_slices.append(slice(*wav_range))
-
-        # Evaluate whether extra padding is warranted or not
-        last_wav_range = wav_slices[-1]
-        coverage = (n_samples - last_wav_range.start) / (last_wav_range.stop - last_wav_range.start)
-        if coverage < min_coverage and len(mel_slices) > 1:
-            mel_slices = mel_slices[:-1]
-            wav_slices = wav_slices[:-1]
-
-        return wav_slices, mel_slices
+class VoiceEncoder:
+    def __init__(self, weights_fpath: t.Optional[str] = None, device: t.Optional[torch.device] = None, verbose=True):
+        """
+        :param weights_fpath: path to saved model weights
+        :param device: either a torch device or the name of a torch device (e.g. "cpu", "cuda")
+        """
+        self.device = device or torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        
+        # Create model
+        self.model = SpeakerEncoder(self.device, verbose)
+        
+        # Load model weights
+        weights_fpath = weights_fpath or Path(__file__).resolve().parent.joinpath("pretrained.pt")
+        try:
+            checkpoint = torch.load(weights_fpath, map_location=self.device, weights_only=True)
+            consume_prefix_in_state_dict_if_present(checkpoint, "module.")
+            self.model.load_state_dict(checkpoint)
+            self.model.eval()
+        except Exception as e:
+            print(f"Error loading model weights from {weights_fpath}: {str(e)}")
+            print("Attempting to continue with uninitialized model...")
 
     def embed_utterance(self, wav: np.ndarray, return_partials=False, rate=1.3, min_coverage=0.75):
         """
-        Computes an embedding for a single utterance. The utterance is divided in partial
-        utterances and an embedding is computed for each. The complete utterance embedding is the
-        L2-normed average embedding of the partial utterances.
-
-        TODO: independent batched version of this function
-
-        :param wav: a preprocessed utterance waveform as a numpy array of float32
-        :param return_partials: if True, the partial embeddings will also be returned along with
-        the wav slices corresponding to each partial utterance.
-        :param rate: how many partial utterances should occur per second. Partial utterances must
-        cover the span of the entire utterance, thus the rate should not be lower than the inverse
-        of the duration of a partial utterance. By default, partial utterances are 1.6s long and
-        the minimum rate is thus 0.625.
-        :param min_coverage: when reaching the last partial utterance, it may or may not have
-        enough frames. If at least <min_pad_coverage> of <partials_n_frames> are present,
-        then the last partial utterance will be considered by zero-padding the audio. Otherwise,
-        it will be discarded. If there aren't enough frames for one partial utterance,
-        this parameter is ignored so that the function always returns at least one slice.
-        :return: the embedding as a numpy array of float32 of shape (model_embedding_size,). If
-        <return_partials> is True, the partial utterances as a numpy array of float32 of shape
-        (n_partials, model_embedding_size) and the wav partials as a list of slices will also be
-        returned.
+        Computes an embedding for a single utterance.
+        
+        # Arguments
+        wav: Preprocessed waveform of a single utterance
+        return_partials: if True, the partial embeddings will also be returned
+        rate: how many partial utterances to generate per second of audio.
+        min_coverage: when generating partial utterances, some utterances may be too short. 
+        
+        # Returns
+        The embedding as a numpy array of float32 of shape (model_embedding_size,).
         """
-        # Compute where to split the utterance into partials and pad the waveform with zeros if
-        # the partial utterances cover a larger range.
-        wav_slices, mel_slices = self.compute_partial_slices(len(wav), rate, min_coverage)
-        max_wave_length = wav_slices[-1].stop
+        # Compute where to split the utterance into partials
+        wave_slices, mel_slices = self.model.compute_partial_slices(len(wav), rate, min_coverage)
+        max_wave_length = wave_slices[-1].stop
         if max_wave_length >= len(wav):
             wav = np.pad(wav, (0, max_wave_length - len(wav)), "constant")
-
+        
         # Split the utterance into partials and forward them through the model
-        mel = audio.wav_to_mel_spectrogram(wav)
+        mel = wav2mel(wav)
         mels = np.array([mel[s] for s in mel_slices])
         with torch.no_grad():
             mels = torch.from_numpy(mels).to(self.device)
-            partial_embeds = self(mels).cpu().numpy()
-
+            partial_embeds = self.model(mels).cpu().numpy()
+        
         # Compute the utterance embedding from the partial embeddings
         raw_embed = np.mean(partial_embeds, axis=0)
         embed = raw_embed / np.linalg.norm(raw_embed, 2)
-
+        
         if return_partials:
-            return embed, partial_embeds, wav_slices
+            return embed, partial_embeds, wave_slices
         return embed
 
-    def embed_speaker(self, wavs: List[np.ndarray], **kwargs):
+    def embed_speaker(self, wavs: t.List[np.ndarray], **kwargs):
         """
-        Compute the embedding of a collection of wavs (presumably from the same speaker) by
-        averaging their embedding and L2-normalizing it.
-
-        :param wavs: list of wavs a numpy arrays of float32.
-        :param kwargs: extra arguments to embed_utterance()
-        :return: the embedding as a numpy array of float32 of shape (model_embedding_size,).
+        Compute the embedding of a collection of wavs (presumably from the same speaker) by averaging.
         """
-        raw_embed = np.mean([self.embed_utterance(wav, return_partials=False, **kwargs) \
-                             for wav in wavs], axis=0)
+        raw_embed = np.mean([self.embed_utterance(wav, return_partials=False, **kwargs) 
+                          for wav in wavs], axis=0)
         return raw_embed / np.linalg.norm(raw_embed, 2)
+
+    def similarity_matrix(self, embeds):
+        """
+        Computes the similarity matrix according the section 2.1 of GE2E.
+
+        :param embeds: the embeddings as a tensor of shape (batch_size, embedding_size)
+        :return: the similarity matrix as a tensor of shape (batch_size, batch_size)
+        """
+        speakers_per_batch, utterances_per_speaker = embeds.shape[:2]
+        
+        # Inclusive centroids (1 per speaker)
+        centroids_incl = torch.mean(embeds, dim=1)
+        centroids_incl = centroids_incl / torch.norm(centroids_incl, dim=1, keepdim=True)
+        
+        # Exclusive centroids (1 per utterance)
+        centroids_excl = (torch.sum(embeds, dim=1, keepdim=True) - embeds)
+        centroids_excl /= (utterances_per_speaker - 1)
+        centroids_excl = centroids_excl / torch.norm(centroids_excl, dim=2, keepdim=True)
+
+        # Similarity matrix
+        sim_matrix = torch.zeros(speakers_per_batch, utterances_per_speaker,
+                               speakers_per_batch)
+        mask_matrix = 1 - np.eye(speakers_per_batch, dtype=np.int)
+        for j in range(speakers_per_batch):
+            mask = np.where(mask_matrix[j])[0]
+            sim_matrix[mask, :, j] = (embeds[mask] * centroids_incl[j]).sum(dim=2)
+            sim_matrix[j, :, j] = (embeds[j] * centroids_excl[j]).sum(dim=1)
+        
+        return sim_matrix
+
+    def loss(self, embeds):
+        """
+        Computes the loss according to section 2.1 of GE2E.
+        
+        :param embeds: the embeddings as a tensor of shape (batch_size, embedding_size)
+        :return: the loss and the EER for this batch of embeddings.
+        """
+        speakers_per_batch, utterances_per_speaker = embeds.shape[:2]
+        
+        # Loss
+        sim_matrix = self.similarity_matrix(embeds)
+        sim_matrix = sim_matrix * self.similarity_weight + self.similarity_bias
+        loss = torch.mean(
+            torch.cat([
+                -(F.log_softmax(sim_matrix[speakers_per_batch:, :, i], dim=1)[:, i] +
+                  F.log_softmax(sim_matrix[i, :, :speakers_per_batch].T, dim=1)[:, i])
+                for i in range(speakers_per_batch)
+            ])
+        )
+        
+        # EER (not backpropagated)
+        with torch.no_grad():
+            inv_argmax = lambda i: np.eye(1, speakers_per_batch, i, dtype=np.int)[0]
+            labels = np.repeat(np.arange(speakers_per_batch), utterances_per_speaker)
+            preds = sim_matrix.detach().cpu().numpy().reshape((speakers_per_batch * utterances_per_speaker, speakers_per_batch))
+            fpr, tpr, thresholds = roc_curve(labels, preds)
+            eer = fpr[np.nanargmin(np.abs(fpr - (1 - tpr)))]
+        
+        return loss, eer
