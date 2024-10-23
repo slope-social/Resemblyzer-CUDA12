@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="resemblyzer",
-    version="0.2.1",
+    version="0.2.0",
     description="Real Time Voice Cloning: Transfer learning from Speaker Verification to Multispeaker Text-To-Speech Synthesis",
     url="https://github.com/slope-social/Resemblyzer-CUDA12",
     author="Slope Social",
@@ -13,14 +13,12 @@ setup(
     },
     python_requires=">=3.7",
     install_requires=[
-        "torch>=2.0.0+cu121",
-        "torchaudio>=2.0.0+cu121",
-        "numpy>=1.17.0",
-        "scipy>=1.3.0",
-        "scikit-learn>=0.22.0",
-        "librosa>=0.8.0",
-        "sounddevice>=0.4.0",
+        "librosa>=0.9.1",
+        "numpy>=1.20.0",
         "webrtcvad>=2.0.10",
+        "torch>=2.0.0",
+        "scipy>=1.2.1",
+        "typing",
     ],
     include_package_data=True
 )
