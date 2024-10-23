@@ -1,0 +1,8 @@
+librosa>=0.9.1
+numpy>=1.20.0
+webrtcvad>=2.0.10
+--extra-index-url https://download.pytorch.org/whl/cu121
+torch>=2.0.0+cu121
+torchaudio>=2.0.0+cu121
+scipy>=1.2.1
+typing
