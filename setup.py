@@ -13,7 +13,8 @@ setup(
     },
     python_requires=">=3.7",
     install_requires=[
-        "torch>=2.0.0",
+        "torch>=2.0.0+cu121",
+        "torchaudio>=2.0.0+cu121",
         "numpy>=1.17.0",
         "scipy>=1.3.0",
         "scikit-learn>=0.22.0",
