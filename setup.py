@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="resemblyzer",
-    version="0.2.0",
+    version="0.2.1",
     description="Real Time Voice Cloning: Transfer learning from Speaker Verification to Multispeaker Text-To-Speech Synthesis",
     url="https://github.com/slope-social/Resemblyzer-CUDA12",
     author="Slope Social",
