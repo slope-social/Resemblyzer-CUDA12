@@ -1,6 +1,6 @@
---find-links https://download.pytorch.org/whl/cu121
-torch==2.4.1+cu121 
-torchaudio==2.4.1+cu121
+--find-links https://download.pytorch.org/whl/nightly/cu121
+torch==2.6.0.dev20241026+cu121
+torchaudio==2.6.0.dev20241026+cu121
 librosa>=0.10.1
 numpy>=1.23.5
 webrtcvad>=2.0.10
