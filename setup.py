@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="resemblyzer",
-    version="0.2.2",
+    version="0.2.3",
     description="Real Time Voice Cloning with CUDA 12 Support",
     url="https://github.com/slope-social/Resemblyzer-CUDA12",
     author="Slope Social",
