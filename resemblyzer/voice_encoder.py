@@ -1,20 +1,32 @@
-from resemblyzer.hparams import *
-from resemblyzer import audio
-from pathlib import Path
-from typing import Union, List
-from torch import nn
-from time import perf_counter as timer
 import numpy as np
+from resemblyzer.hparams import *
+from resemblyzer import audio, preprocess_wav
+from sklearn.cluster import AgglomerativeClustering
+from typing import List, Tuple, Union
 import torch
+import torch.nn.utils.rnn as rnn
+import logging
+from pathlib import Path
+from time import perf_counter as timer
+import torch.nn as nn
+from functools import wraps
 
+logger = logging.getLogger(__name__)
 
-class VoiceEncoder(nn.Module):
+def ensure_cpu_tensor(func):
+    """Decorator to ensure tensors are moved to CPU before numpy conversion"""
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        result = func(*args, **kwargs)
+        if torch.is_tensor(result) and result.is_cuda:
+            return result.detach().cpu()
+        return result
+    return wrapper
+
+class CUDAVoiceEncoder(nn.Module):
     def __init__(self, device: Union[str, torch.device]=None, verbose=True, weights_fpath: Union[Path, str]=None):
         """
-        If None, defaults to cuda if it is available on your machine, otherwise the model will
-        run on cpu. Outputs are always returned on the cpu, as numpy arrays.
-        :param weights_fpath: path to "<CUSTOM_MODEL>.pt" file path.
-        If None, defaults to built-in "pretrained.pt" model
+        Enhanced VoiceEncoder with proper CUDA handling.
         """
         super().__init__()
 
@@ -30,79 +42,55 @@ class VoiceEncoder(nn.Module):
             device = torch.device(device)
         self.device = device
 
-        # Load the pretrained model'speaker weights
+        # Load the pretrained model weights
         if weights_fpath is None:
             weights_fpath = Path(__file__).resolve().parent.joinpath("pretrained.pt")
         else:
             weights_fpath = Path(weights_fpath)
 
         if not weights_fpath.exists():
-            raise Exception("Couldn't find the voice encoder pretrained model at %s." %
-                            weights_fpath)
+            raise Exception(f"Couldn't find the voice encoder pretrained model at {weights_fpath}")
+        
         start = timer()
         try:
-            # CUDA 12 fix: Add weights_only=True and better error handling
             checkpoint = torch.load(weights_fpath, map_location=device, weights_only=True)
             if "model_state" in checkpoint:
                 self.load_state_dict(checkpoint["model_state"], strict=False)
             else:
                 self.load_state_dict(checkpoint, strict=False)
         except RuntimeError as e:
-            print(f"WARNING: Error loading model weights: {str(e)}")
-            print("Attempting to continue with uninitialized model...")
-            
-        self.to(device)
+            logger.error(f"Error loading model weights: {str(e)}")
+            raise
 
+        self.to(device)
         if verbose:
-            print("Loaded the voice encoder model on %s in %.2f seconds." %
-                  (device.type, timer() - start))
+            logger.info(f"Loaded the voice encoder model on {device.type} in {timer() - start:.2f} seconds.")
 
     def forward(self, mels: torch.FloatTensor):
         """
-        Computes the embeddings of a batch of utterance spectrograms.
-
-        :param mels: a batch of mel spectrograms of same duration as a float32 tensor of shape
-        (batch_size, n_frames, n_channels)
-        :return: the embeddings as a float 32 tensor of shape (batch_size, embedding_size).
-        Embeddings are positive and L2-normed, thus they lay in the range [0, 1].
+        CUDA-aware forward pass.
         """
-        # Pass the input through the LSTM layers and retrieve the final hidden state of the last
-        # layer. Apply a cutoff to 0 for negative values and L2 normalize the embeddings.
-        _, (hidden, _) = self.lstm(mels)
-        embeds_raw = self.relu(self.linear(hidden[-1]))
-        return embeds_raw / torch.norm(embeds_raw, dim=1, keepdim=True)
+        with torch.cuda.device(self.device):
+            _, (hidden, _) = self.lstm(mels)
+            embeds_raw = self.relu(self.linear(hidden[-1]))
+            return embeds_raw / torch.norm(embeds_raw, dim=1, keepdim=True)
 
     @staticmethod
     def compute_partial_slices(n_samples: int, rate, min_coverage):
         """
-        Computes where to split an utterance waveform and its corresponding mel spectrogram to
-        obtain partial utterances of <partials_n_frames> each. Both the waveform and the
-        mel spectrogram slices are returned, so as to make each partial utterance waveform
-        correspond to its spectrogram.
-
-        :param n_samples: the number of samples in the waveform
-        :param rate: how many partial utterances should occur per second. Partial utterances must
-        cover the span of the entire utterance, thus the rate should not be lower than the inverse
-        of the duration of a partial utterance. By default, partial utterances are 1.6s long and
-        the minimum rate is thus 0.625.
-        :param min_coverage: when reaching the last partial utterance, it may or may not have
-        enough frames. If at least <min_pad_coverage> of <partials_n_frames> are present,
-        then the last partial utterance will be considered by zero-padding the audio. Otherwise,
-        it will be discarded. If there aren't enough frames for one partial utterance,
-        this parameter is ignored so that the function always returns at least one slice.
-        :return: the waveform slices and mel spectrogram slices as lists of array slices.
+        Compute partial utterance slices.
         """
         assert 0 < min_coverage <= 1
 
-        # Compute how many frames separate two partial utterances
         samples_per_frame = int((sampling_rate * mel_window_step / 1000))
         n_frames = int(np.ceil((n_samples + 1) / samples_per_frame))
         frame_step = int(np.round((sampling_rate / rate) / samples_per_frame))
-        assert 0 < frame_step, "The rate is too high"
-        assert frame_step <= partials_n_frames, "The rate is too low, it should be %f at least" % \
-            (sampling_rate / (samples_per_frame * partials_n_frames))
+        
+        if frame_step <= 0:
+            raise ValueError("The rate is too high")
+        if frame_step > partials_n_frames:
+            raise ValueError(f"The rate is too low, it should be {sampling_rate / (samples_per_frame * partials_n_frames)} at least")
 
-        # Compute the slices
         wav_slices, mel_slices = [], []
         steps = max(1, n_frames - partials_n_frames + frame_step + 1)
         for i in range(0, steps, frame_step):
@@ -111,67 +99,290 @@ class VoiceEncoder(nn.Module):
             mel_slices.append(slice(*mel_range))
             wav_slices.append(slice(*wav_range))
 
-        # Evaluate whether extra padding is warranted or not
-        last_wav_range = wav_slices[-1]
-        coverage = (n_samples - last_wav_range.start) / (last_wav_range.stop - last_wav_range.start)
-        if coverage < min_coverage and len(mel_slices) > 1:
-            mel_slices = mel_slices[:-1]
-            wav_slices = wav_slices[:-1]
+        if len(mel_slices) > 1:
+            last_wav_range = wav_slices[-1]
+            coverage = (n_samples - last_wav_range.start) / (last_wav_range.stop - last_wav_range.start)
+            if coverage < min_coverage:
+                mel_slices = mel_slices[:-1]
+                wav_slices = wav_slices[:-1]
 
         return wav_slices, mel_slices
 
-    def embed_utterance(self, wav: np.ndarray, return_partials=False, rate=1.3, min_coverage=0.75):
+    def embed_utterance(self, wav: Union[np.ndarray, torch.Tensor], return_partials=False, rate=1.3, min_coverage=0.75):
         """
-        Computes an embedding for a single utterance.
+        CUDA-aware utterance embedding.
+        """
+        # Handle CUDA tensor input
+        if torch.is_tensor(wav):
+            if wav.is_cuda:
+                wav = wav.cpu()
+            wav = wav.detach().numpy()
 
-        :param wav: a preprocessed utterance waveform as a numpy array of float32
-        :param return_partials: if True, the partial embeddings will also be returned along with
-        the wav slices corresponding to each partial utterance.
-        :param rate: how many partial utterances should occur per second. Partial utterances must
-        cover the span of the entire utterance, thus the rate should not be lower than the inverse
-        of the duration of a partial utterance. By default, partial utterances are 1.6s long and
-        the minimum rate is thus 0.625.
-        :param min_coverage: when reaching the last partial utterance, it may or may not have
-        enough frames. If at least <min_pad_coverage> of <partials_n_frames> are present,
-        then the last partial utterance will be considered by zero-padding the audio. Otherwise,
-        it will be discarded. If there aren't enough frames for one partial utterance,
-        this parameter is ignored so that the function always returns at least one slice.
-        :return: the embedding as a numpy array of float32 of shape (model_embedding_size,). If
-        <return_partials> is True, the partial utterances as a numpy array of float32 of shape
-        (n_partials, model_embedding_size) and the wav partials as a list of slices will also be
-        returned.
-        """
-        # Compute where to split the utterance into partials and pad the waveform with zeros if
-        # the partial utterances cover a larger range.
+        # Ensure correct dimensions
+        if len(wav.shape) == 2:
+            wav = wav[0]
+        elif len(wav.shape) > 2:
+            raise ValueError(f"Waveform has too many dimensions ({len(wav.shape)})")
+
+        # Compute slices and pad if necessary
         wav_slices, mel_slices = self.compute_partial_slices(len(wav), rate, min_coverage)
         max_wave_length = wav_slices[-1].stop
         if max_wave_length >= len(wav):
             wav = np.pad(wav, (0, max_wave_length - len(wav)), "constant")
 
-        # Split the utterance into partials and forward them through the model
+        # Process the utterance
         mel = audio.wav_to_mel_spectrogram(wav)
         mels = np.array([mel[s] for s in mel_slices])
-        with torch.no_grad():
+        
+        with torch.no_grad(), torch.cuda.device(self.device):
             mels = torch.from_numpy(mels).to(self.device)
-            partial_embeds = self(mels).cpu().numpy()
+            partial_embeds = self(mels)
+            partial_embeds = partial_embeds.cpu().numpy()
 
-        # Compute the utterance embedding from the partial embeddings
         raw_embed = np.mean(partial_embeds, axis=0)
         embed = raw_embed / np.linalg.norm(raw_embed, 2)
 
-        if return_partials:
-            return embed, partial_embeds, wav_slices
-        return embed
+        return (embed, partial_embeds, wav_slices) if return_partials else embed
 
-    def embed_speaker(self, wavs: List[np.ndarray], **kwargs):
-        """
-        Compute the embedding of a collection of wavs (presumably from the same speaker) by
-        averaging their embedding and L2-normalizing it.
+class ResemblyzerDiarizer:
+    def __init__(self, use_cuda: bool = True):
+        """Initialize with optimal device management"""
+        self.device = torch.device("cuda" if use_cuda and torch.cuda.is_available() else "cpu")
+        try:
+            self.encoder = CUDAVoiceEncoder(device=self.device)
+            logger.info(f"Initialized CUDA-aware VoiceEncoder on device: {self.device}")
+        except Exception as e:
+            logger.warning(f"Failed to initialize VoiceEncoder on {self.device}: {str(e)}")
+            self.device = torch.device("cpu")
+            self.encoder = CUDAVoiceEncoder(device=self.device)
 
-        :param wavs: list of wavs a numpy arrays of float32.
-        :param kwargs: extra arguments to embed_utterance()
-        :return: the embedding as a numpy array of float32 of shape (model_embedding_size,).
-        """
-        raw_embed = np.mean([self.embed_utterance(wav, return_partials=False, **kwargs) \
-                             for wav in wavs], axis=0)
-        return raw_embed / np.linalg.norm(raw_embed, 2)
+    def preprocess_audio(self, audio_data: Union[np.ndarray, torch.Tensor]) -> torch.Tensor:
+        """Preprocess audio data with CUDA awareness"""
+        if isinstance(audio_data, np.ndarray):
+            audio_tensor = torch.from_numpy(audio_data)
+        elif isinstance(audio_data, torch.Tensor):
+            audio_tensor = audio_data
+        else:
+            raise TypeError(f"Unsupported audio data type: {type(audio_data)}")
+        
+        return audio_tensor.to(self.device, non_blocking=True)
+
+    def process_batch(self, segments: List[dict], audio_tensor: torch.Tensor) -> np.ndarray:
+        """Process multiple segments in batch for improved efficiency"""
+        with torch.no_grad(), torch.cuda.device(self.device):
+            batch_embeddings = []
+            batch_size = 32  # Adjustable based on GPU memory
+
+            for i in range(0, len(segments), batch_size):
+                batch = segments[i:i + batch_size]
+                try:
+                    batch_audio = [audio_tensor[int(s['start'] * 16000):int(s['end'] * 16000)].contiguous() 
+                                 for s in batch]
+                    
+                    batch_audio = [audio for audio in batch_audio if audio.numel() > 0]
+                    if not batch_audio:
+                        continue
+
+                    max_len = max(audio.size(0) for audio in batch_audio)
+                    padded_audio = rnn.pad_sequence(
+                        batch_audio, batch_first=True, padding_value=0
+                    )
+                    
+                    embeddings = self.encoder.embed_utterance(padded_audio)
+                    batch_embeddings.append(embeddings)
+
+                except Exception as e:
+                    logger.error(f"Failed to process batch: {str(e)}", exc_info=True)
+                    continue
+
+            if not batch_embeddings:
+                return np.zeros((1, 256), dtype=np.float32)
+
+            return np.concatenate(batch_embeddings, axis=0)
+
+    def _extract_embeddings(self, audio: np.ndarray, segments: List[dict]) -> np.ndarray:
+        """Extract embeddings with optimized tensor handling"""
+        embeddings = []
+        
+        try:
+            audio_tensor = self.preprocess_audio(audio)
+            
+            if len(segments) > 32:
+                return self.process_batch(segments, audio_tensor)
+            
+            for segment in segments:
+                start_sample = int(segment['start'] * 16000)
+                end_sample = int(segment['end'] * 16000)
+                
+                try:
+                    segment_audio = audio_tensor[start_sample:end_sample].contiguous()
+                    
+                    if segment_audio.numel() > 0:
+                        with torch.cuda.device(self.device):
+                            with torch.no_grad():
+                                embedding = self.encoder.embed_utterance(segment_audio)
+                                if embedding is not None:
+                                    embeddings.append(embedding)
+                    else:
+                        logger.warning(f"Empty segment detected: {segment}")
+                        
+                except Exception as e:
+                    logger.warning(f"Failed to process segment: {str(e)}", exc_info=True)
+                    continue
+
+        except Exception as e:
+            logger.error(f"Failed during embedding extraction: {str(e)}", exc_info=True)
+            return np.zeros((1, 256), dtype=np.float32)
+
+        if not embeddings:
+            logger.warning("No valid embeddings extracted")
+            return np.zeros((1, 256), dtype=np.float32)
+
+        try:
+            return np.stack(embeddings)
+        except Exception as e:
+            logger.error(f"Failed to stack embeddings: {str(e)}", exc_info=True)
+            return np.zeros((1, 256), dtype=np.float32)
+
+    def _perform_clustering(self, embeddings: np.ndarray, min_speakers: int, max_speakers: int) -> np.ndarray:
+        """Perform speaker clustering with constraints"""
+        try:
+            # Initial clustering with agglomerative clustering
+            clustering = AgglomerativeClustering(
+                n_clusters=None,
+                distance_threshold=0.3,
+                linkage='average'
+            )
+            labels = clustering.fit_predict(embeddings)
+
+            # Adjust number of speakers if needed
+            unique_speakers = np.unique(labels)
+            n_speakers = len(unique_speakers)
+
+            if n_speakers < min_speakers:
+                logger.info(f"Found {n_speakers} speakers, forcing minimum of {min_speakers}")
+                clustering = AgglomerativeClustering(n_clusters=min_speakers)
+                labels = clustering.fit_predict(embeddings)
+            elif n_speakers > max_speakers:
+                logger.info(f"Found {n_speakers} speakers, limiting to maximum of {max_speakers}")
+                clustering = AgglomerativeClustering(n_clusters=max_speakers)
+                labels = clustering.fit_predict(embeddings)
+
+            return labels
+
+        except Exception as e:
+            logger.error(f"Clustering failed: {str(e)}", exc_info=True)
+            return np.zeros(len(embeddings), dtype=np.int32)
+
+    def _merge_adjacent_segments(self, segments: List[dict]) -> List[dict]:
+        """Merge adjacent segments from same speaker"""
+        if not segments:
+            return []
+
+        try:
+            merged_segments = []
+            current_segment = segments[0].copy()
+
+            for segment in segments[1:]:
+                # Check if current segment and next segment have same speaker and are adjacent
+                if (current_segment['speaker'] == segment['speaker'] and 
+                    abs(current_segment['end'] - segment['start']) < 0.5):  # 500ms threshold
+                    # Merge segments
+                    current_segment['end'] = segment['end']
+                    # Merge text if present
+                    if 'text' in current_segment and 'text' in segment:
+                        current_segment['text'] = (current_segment['text'].strip() + ' ' + 
+                                                 segment['text'].strip()).strip()
+                else:
+                    # Add current segment to merged list and start new one
+                    merged_segments.append(current_segment)
+                    current_segment = segment.copy()
+
+            # Add final segment
+            merged_segments.append(current_segment)
+
+            return merged_segments
+
+        except Exception as e:
+            logger.error(f"Segment merging failed: {str(e)}", exc_info=True)
+            return segments
+
+    def diarize(self, audio: np.ndarray, segments: List[dict], min_speakers: int = 2, max_speakers: int = 10) -> List[dict]:
+        """Main diarization method with improved error handling"""
+        try:
+            # Create smaller segments if necessary
+            max_segment_duration = 30
+            new_segments = []
+            
+            for segment in segments:
+                start = segment['start']
+                end = segment['end']
+                while start < end:
+                    new_end = min(start + max_segment_duration, end)
+                    new_segments.append({
+                        'start': start,
+                        'end': new_end,
+                        'text': segment.get('text', ''),
+                        'words': segment.get('words', []),
+                        'speaker': segment.get('speaker', None)
+                    })
+                    start = new_end
+
+            # Extract embeddings with proper error handling
+            embeddings = self._extract_embeddings(audio, new_segments)
+            logger.info(f"Number of embeddings: {len(embeddings)}")
+
+            if len(embeddings) < 2:
+                logger.warning("Not enough embeddings for clustering. Assigning all segments to the same speaker.")
+                for segment in new_segments:
+                    segment['speaker'] = "SPEAKER_0"
+                return new_segments
+
+            # Perform clustering with proper error handling
+            try:
+                labels = self._perform_clustering(embeddings, min_speakers, max_speakers)
+                logger.info(f"Number of unique speakers detected: {len(np.unique(labels))}")
+            except Exception as e:
+                logger.error(f"Clustering failed, defaulting to single speaker: {str(e)}")
+                labels = np.zeros(len(new_segments))
+
+            # Assign speakers to segments
+            for i, segment in enumerate(new_segments):
+                segment['speaker'] = f"SPEAKER_{labels[i]}"
+
+            # Handle word-level speaker assignment
+            for segment in new_segments:
+                if 'words' in segment:
+                    for word in segment['words']:
+                        word['speaker'] = segment['speaker']
+
+            # Merge adjacent segments with improved error handling
+            try:
+                merged_segments = self._merge_adjacent_segments(new_segments)
+                logger.info(f"Number of segments after merging: {len(merged_segments)}")
+            except Exception as e:
+                logger.error(f"Segment merging failed, using unmerged segments: {str(e)}")
+                merged_segments = new_segments
+
+            return merged_segments
+
+        except Exception as e:
+            logger.error(f"Diarization failed: {str(e)}", exc_info=True)
+            # Return the original segments with a default speaker in case of failure
+            for segment in segments:
+                segment['speaker'] = "SPEAKER_0"
+            return segments
+
+
+def diarize(audio: np.ndarray, result: dict, min_speakers: int = 2, max_speakers: int = 10, use_cuda: bool = True) -> dict:
+    """Main diarization interface with WaveTrace compatibility"""
+    try:
+        diarizer = ResemblyzerDiarizer(use_cuda=use_cuda)
+        diarized_segments = diarizer.diarize(audio, result['segments'], min_speakers, max_speakers)
+        result['segments'] = diarized_segments
+        logger.info(f"Diarization complete. Number of segments: {len(result['segments'])}")
+        logger.debug(f"First segment speaker: {result['segments'][0].get('speaker', 'No speaker')}")
+        return result
+    except Exception as e:
+        logger.error(f"Diarization failed: {str(e)}", exc_info=True)
+        return result
