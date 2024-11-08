@@ -386,3 +386,8 @@ def diarize(audio: np.ndarray, result: dict, min_speakers: int = 2, max_speakers
     except Exception as e:
         logger.error(f"Diarization failed: {str(e)}", exc_info=True)
         return result
+
+# Alias CUDAVoiceEncoder as VoiceEncoder for backward compatibility
+VoiceEncoder = CUDAVoiceEncoder
+
+__all__ = ['VoiceEncoder', 'CUDAVoiceEncoder']
