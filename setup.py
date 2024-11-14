@@ -13,8 +13,8 @@ setup(
     },
     python_requires=">=3.10",
     install_requires=[
-        "torch==2.6.0.dev20241026+cu121",
-        "torchaudio==2.5.0.dev20241026+cu121",
+        "torch==2.6.0.dev20241112+cu121",
+        "torchaudio==2.5.0.dev20241112+cu121",
         "librosa>=0.10.1",
         "numpy>=1.23.5",
         "webrtcvad>=2.0.10",
