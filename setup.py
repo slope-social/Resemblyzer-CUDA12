@@ -18,7 +18,7 @@ setup(
         "librosa>=0.10.1",
         "numpy>=1.23.5",
         "webrtcvad>=2.0.10",
-        "scipy>=1.14.1",
+        "scipy>=1.11.3",
         "typing_extensions>=4.12.0"
     ],
     dependency_links=[
