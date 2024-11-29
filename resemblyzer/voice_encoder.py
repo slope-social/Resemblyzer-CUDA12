@@ -35,6 +35,9 @@ class CUDAVoiceEncoder(nn.Module):
         self.linear = nn.Linear(model_hidden_size, model_embedding_size)
         self.relu = nn.ReLU()
 
+        # Add the sampling rate attribute
+        self.sampling_rate = 16000  # Resemblyzer expects audio sampled at 16 kHz
+
         # Get the target device
         if device is None:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
